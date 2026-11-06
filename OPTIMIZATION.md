@@ -1,6 +1,6 @@
 # Drive read latency investigation
 
-This is an experimental open-source fork of [rclone](https://github.com/rclone/rclone). The upstream MIT license, copyright notices and contribution instructions remain in effect. No performance patch has been implemented yet.
+This is an experimental open-source fork of [rclone](https://github.com/rclone/rclone). The upstream MIT license, copyright notices and contribution instructions remain in effect. A minimal VFS initial-seek patch is under local test; no fix for the reported cold first-read delay is claimed.
 
 ## Objective
 
@@ -25,3 +25,11 @@ The public repository must contain only upstream source, generic documentation, 
 Cloud integration tests are opt-in and use credentials outside the checkout. Never read a real user archive or change a running production deployment without explicit authorization for that work. Use read-only measurements; do not move, delete, overwrite or transcode source files. Report when tests cannot run, and do not describe a hypothesis as a measured result.
 
 Follow AGENTS.md and CONTRIBUTING.md. Preserve attribution and do not submit an upstream pull request without maintainer review of the actual code and results.
+
+## Baseline: 2026-11-06
+
+The first synthetic investigation is documented in [docs/drive-read-baseline.md](docs/drive-read-baseline.md). The benchmark exercises unchanged upstream production code at `7c60060d4cb811fba5cf4e814207df4c7091d4df`; it adds test scaffolding only. It does not reproduce or explain the historical 38-second observation. No performance fix is claimed.
+
+## VFS and 1.75.2 follow-up
+
+[docs/drive-vfs-read-investigation.md](docs/drive-vfs-read-investigation.md) records the full-listing path used by `serve http`, 8 MiB synthetic HTTP ranges on official 1.75.2, and a generic VFS patch removing an unnecessary zero-offset media open before an initial nonzero read. This seek patch does not change directory listing or explain the reported cold first-byte delay.
