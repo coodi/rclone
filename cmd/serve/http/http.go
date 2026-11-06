@@ -23,6 +23,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/flags"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/rc"
 	libhttp "github.com/rclone/rclone/lib/http"
 	"github.com/rclone/rclone/lib/http/serve"
@@ -35,6 +36,18 @@ import (
 
 // OptionsInfo describes the Options in use
 var OptionsInfo = fs.Options{{
+	Name:    "direct_read",
+	Default: false,
+	Help: `Look up known file paths directly instead of listing VFS directories.
+
+Requires --read-only and --vfs-cache-mode off, without filters, auth proxy,
+VFS links, metadata files, --no-seek, --no-modtime, or case-insensitive/duplicate-normalizing lookup.
+Files use the backend's exact-path and duplicate-name semantics. No file object
+cache is added: each request resolves the path again. Directory requests still
+use VFS. File reads skip VFS buffering and parallel read-ahead; configured read
+chunk size bounds sequential backend requests. HEAD, byte ranges and conditional
+GET use the existing HTTP behavior. Unknown-size objects fall back to VFS.`,
+}, {
 	Name:    "disable_zip",
 	Default: false,
 	Help:    "Disable zip download of directories",
@@ -52,6 +65,7 @@ type Options struct {
 	Auth           libhttp.AuthConfig
 	HTTP           libhttp.Config
 	Template       libhttp.TemplateConfig
+	DirectRead     bool `config:"direct_read"`
 	DisableZip     bool `config:"disable_zip"`
 	DisableDirList bool `config:"disable_dir_list"`
 }
@@ -172,6 +186,14 @@ func (s *HTTP) auth(r *http.Request, user, pass string) (value any, err error) {
 }
 
 func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Options, proxyOpt *proxy.Options) (_ *HTTP, err error) {
+	if opt.DirectRead {
+		if !vfsOpt.ReadOnly || vfsOpt.CacheMode != vfscommon.CacheModeOff {
+			return nil, fmt.Errorf("--direct-read requires --read-only and --vfs-cache-mode off")
+		}
+		if !filter.GetConfig(ctx).InActive() || proxyOpt.AuthProxy != "" || vfsOpt.Links || fs.GetConfig(ctx).Links || vfsOpt.MetadataExtension != "" || vfsOpt.CaseInsensitive || fs.GetConfig(ctx).IgnoreCaseSync || vfsOpt.BlockNormDupes || vfsOpt.NoSeek || vfsOpt.NoModTime {
+			return nil, fmt.Errorf("--direct-read cannot be combined with filters, auth proxy, VFS links, metadata files, normalized duplicate detection, case-insensitive lookup, --no-seek or --no-modtime")
+		}
+	}
 	s := &HTTP{
 		f:        f,
 		ctx:      ctx,
@@ -343,6 +365,10 @@ func (s *HTTP) serveFile(w http.ResponseWriter, r *http.Request, remote string) 
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		fs.Errorf(nil, "Failed to serve file: %v", err)
+		return
+	}
+
+	if s.opt.DirectRead && s.serveDirectFile(w, r, remote, VFS) {
 		return
 	}
 

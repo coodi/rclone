@@ -2,7 +2,7 @@
 
 ## What source inspection establishes
 
-The remaining real cold wait has not been localized by the previously supplied aggregate timings. The seek patch removes an unnecessary media open, but the first request still waits tens of seconds. No additional private files, production logs, servers or real cloud objects were accessed for this investigation.
+The previously supplied aggregate timings alone did not localize the remaining real cold wait. The subsequent authorized phase test is recorded in [the cold-read findings and opt-in mode](drive-cold-read-fix.md). The seek patch removes an unnecessary media open, but the first request still waits tens of seconds. No additional private files, production logs, servers or real cloud objects were accessed for this investigation.
 
 The first HTTP request can execute this sequence:
 
@@ -101,7 +101,7 @@ Look for:
 | Media headers fast, first body read slow | Media body availability before rclone consumes data |
 | All provider phases fast, client headers slow | Investigate VFS processing/buffering/scheduling and correlate the client window; do not attribute the gap to Google API without evidence |
 
-The decisive missing evidence is one authorized real cold timing trace and the HEAD/GET aggregate measurements. Aggregate 38–52 second totals and the previous private Range-offset summaries do not contain that phase information.
+This protocol subsequently obtained an authorized real phase summary: the first HEAD spent approximately 33 seconds in VFS preparation, including 33 unfiltered list API calls, before any media request. See [the findings and opt-in mode](drive-cold-read-fix.md). The original aggregate 38–52 second totals alone did not contain that phase information. New listing-start/listing-finished groups record the number of pages per list invocation, without provider identifiers; do not assume the observed 33 calls were pages of one folder.
 
 ## Validation and limits
 

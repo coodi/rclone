@@ -29,6 +29,9 @@ import (
 
 // latencyFixture exercises the real Drive lookup and Open paths without credentials.
 type latencyFixture struct {
+	owned                             bool
+	resourceKey                       string
+	sharedDrive                       bool
 	shortcuts                         int
 	oauthDelay, listDelay, mediaDelay time.Duration
 	timing                            bool
@@ -80,8 +83,18 @@ func newLatencyFixture(tb testing.TB, delay time.Duration) *latencyFixture {
 			return
 		}
 		info := &drive.File{Id: "synthetic-file", Name: "media.bin", ModifiedTime: "2000-01-01T00:00:00Z", MimeType: "application/octet-stream", Size: 1 << 30, Md5Checksum: strings.Repeat("0", 32)}
+		if x.owned {
+			info.Owners = []*drive.User{{Me: true}}
+		}
+		if x.resourceKey != "" {
+			info.ResourceKey = x.resourceKey
+		}
 		if r.URL.Query().Get("alt") == "media" {
 			x.media.Add(1)
+			if x.resourceKey != "" && r.Header.Get("X-Goog-Drive-Resource-Keys") != "synthetic-file/"+x.resourceKey {
+				http.Error(w, "missing synthetic resource key", 403)
+				return
+			}
 			var start, end int64
 			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || start < 0 || end < start || end-start >= int64(len(x.payload)) {
 				http.Error(w, "invalid synthetic range", http.StatusRequestedRangeNotSatisfiable)
@@ -94,6 +107,10 @@ func newLatencyFixture(tb testing.TB, delay time.Duration) *latencyFixture {
 			x.bytes.Add(int64(n))
 		} else if strings.HasSuffix(r.URL.Path, "/files") {
 			x.lists.Add(1)
+			if x.sharedDrive && (r.URL.Query().Get("driveId") != "synthetic-shared-drive" || r.URL.Query().Get("supportsAllDrives") != "true") {
+				http.Error(w, "missing synthetic shared-drive parameters", 400)
+				return
+			}
 			q := r.URL.Query().Get("q")
 			if !strings.Contains(q, "name=") && x.directorySize > 0 {
 				x.unfiltered.Add(1)
@@ -158,6 +175,10 @@ func (x *latencyFixture) newFs(tb testing.TB) *Fs {
 	require.NoError(tb, err)
 	f := &Fs{svc: service, client: client, rootFolderID: "synthetic-root", pacer: fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(0), pacer.Burst(1000000)))}
 	f.opt.ReadTiming = x.timing
+	if x.sharedDrive {
+		f.isTeamDrive = true
+		f.opt.TeamDriveID = "synthetic-shared-drive"
+	}
 	f.features = &fs.Features{}
 	f.ci = fs.GetConfig(ctx)
 	f.dirResourceKeys = new(sync.Map)

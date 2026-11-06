@@ -1035,6 +1035,19 @@ func (f *Fs) getRootID(ctx context.Context) (string, error) {
 //
 // Search params: https://developers.google.com/drive/search-parameters
 func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directoriesOnly, filesOnly, trashedOnly, includeAll bool, fn listFn) (found bool, err error) {
+	var listingTimer *driveReadTimer
+	pages := 0
+	if f.opt.ReadTiming {
+		operation := "list-directory"
+		if title != "" {
+			operation = "list-filtered"
+		}
+		listingTimer = newDriveReadTimer(operation, nil)
+		listingTimer.event("listing-start", fmt.Sprintf("parents=%d", len(dirIDs)))
+		defer func() {
+			listingTimer.event("listing-finished", fmt.Sprintf("parents=%d pages=%d failed=%t", len(dirIDs), pages, err != nil))
+		}()
+	}
 	var query []string
 	if !includeAll {
 		q := "trashed=" + strconv.FormatBool(trashedOnly)
@@ -1167,6 +1180,7 @@ OUTER:
 		if err != nil {
 			return false, fmt.Errorf("couldn't list directory: %w", err)
 		}
+		pages++
 		if files.IncompleteSearch {
 			fs.Errorf(f, "search result INCOMPLETE")
 		}
@@ -4261,6 +4275,9 @@ func (f *Fs) getRemoteInfoWithExport(ctx context.Context, remote string) (
 	directoryID = actualID(directoryID)
 
 	found, err := f.list(ctx, []string{directoryID}, leaf, false, false, f.opt.TrashedOnly, false, func(item *drive.File) bool {
+		if f.opt.AuthOwnerOnly && item.MimeType != driveFolderType && !isAuthOwned(item) {
+			return false
+		}
 		if !f.opt.SkipGdocs {
 			extension, exportName, exportMimeType, isDocument = f.findExportFormat(ctx, item)
 			if exportName == leaf {
