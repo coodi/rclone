@@ -41,3 +41,7 @@ The first synthetic investigation is documented in [docs/drive-read-baseline.md]
 ## Localized cold lookup and opt-in HTTP mode
 
 [docs/drive-cold-read-fix.md](docs/drive-cold-read-fix.md) records the authorized aggregate HEAD/GET phase results: approximately 33 seconds before media, dominated by 33 unfiltered list calls. The new off-by-default `serve http --direct-read` path reuses backend point lookup instead of sibling enumeration for known-size files, with explicit configuration guards and per-request path revalidation. Synthetic HTTP tests compare 33 full-list calls with one filtered lookup. Real validation of this new mode is separate from the earlier seek-patch measurements.
+
+## Stable-base backport
+
+Branch `codex/v1.75.2-direct-read` starts at the official stable tag `v1.75.2`. It contains the isolated initial-seek fix, opt-in read diagnostics, opt-in direct HTTP reading, the matching Drive owner restriction fix and their tests/docs. Unrelated 1.76 development changes are excluded. `--direct-read` remains off by default, requires read-only/cache-off operation, and preserves its unsupported-option guards. This is a modified stable-base fork, not an official upstream release. Deployment validation and private real-object measurements are performed outside this public repository; no private configuration or trace is imported here.
