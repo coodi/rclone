@@ -16,6 +16,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path"
 	"slices"
@@ -577,6 +578,16 @@ need to use --ignore size also.`,
 			Help:     "If Object's are greater, use drive v2 API to download.",
 			Advanced: true,
 		}, {
+			Name:    "read_timing",
+			Default: false,
+			Help: `Log read timing events without URLs, file names, IDs or credentials.
+
+Records API pacing, retries, OAuth HTTP requests, connection setup, response
+headers and body completion at NOTICE level. Intended for diagnosing cold reads.
+Disabled by default; it does not enable HTTP request or header dumps.
+With env_auth, only API phase timings are available; its HTTP client is external.`,
+			Advanced: true,
+		}, {
 			Name:     "pacer_min_sleep",
 			Default:  defaultMinSleep,
 			Help:     "Minimum time to sleep between API calls.",
@@ -833,6 +844,7 @@ type Options struct {
 	KeepRevisionForever       bool                 `config:"keep_revision_forever"`
 	SizeAsQuota               bool                 `config:"size_as_quota"`
 	V2DownloadMinSize         fs.SizeSuffix        `config:"v2_download_min_size"`
+	ReadTiming                bool                 `config:"read_timing"`
 	PacerMinSleep             fs.Duration          `config:"pacer_min_sleep"`
 	PacerBurst                int                  `config:"pacer_burst"`
 	ServerSideAcrossConfigs   bool                 `config:"server_side_across_configs"`
@@ -994,7 +1006,11 @@ func containsString(slice []string, s string) bool {
 
 // getFile returns drive.File for the ID passed and fields passed in
 func (f *Fs) getFile(ctx context.Context, ID string, fields googleapi.Field) (info *drive.File, err error) {
-	err = f.pacer.Call(func() (bool, error) {
+	operation := "metadata"
+	if ID == "root" {
+		operation = "root-metadata"
+	}
+	err = f.readTimingCall(operation, func() (bool, error) {
 		info, err = f.svc.Files.Get(ID).
 			Fields(fields).
 			SupportsAllDrives(true).
@@ -1140,7 +1156,11 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 OUTER:
 	for {
 		var files *drive.FileList
-		err = f.pacer.Call(func() (bool, error) {
+		operation := "list-directory"
+		if title != "" {
+			operation = "list-filtered"
+		}
+		err = f.readTimingCall(operation, func() (bool, error) {
 			files, err = list.Fields(googleapi.Field(fields)).Context(ctx).Do()
 			return f.shouldRetry(ctx, err)
 		})
@@ -1283,9 +1303,11 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 			t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 		}
 	})
-	return &http.Client{
-		Transport: t,
+	var transport http.RoundTripper = t
+	if opt.ReadTiming {
+		transport = &driveReadTimingTransport{base: t}
 	}
+	return &http.Client{Transport: transport}
 }
 
 func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData []byte) (*http.Client, error) {
@@ -1447,9 +1469,17 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, error) {
+	started := time.Now()
 	f, err := newFs(ctx, name, path, m)
 	if err != nil {
 		return nil, err
+	}
+
+	if f.opt.ReadTiming {
+		timer := newDriveReadTimer("backend", nil)
+		timer.started = started
+		timer.event("backend-created", "")
+		defer timer.event("root-path-finished", "")
 	}
 
 	// Set the root folder ID
@@ -1877,7 +1907,7 @@ func (f *Fs) fetchFormats(ctx context.Context) {
 	fetchFormatsOnce.Do(func() {
 		var about *drive.About
 		var err error
-		err = f.pacer.Call(func() (bool, error) {
+		err = f.readTimingCall("formats", func() (bool, error) {
 			about, err = f.svc.About.Get().
 				Fields("exportFormats,importFormats").
 				Context(ctx).Do()
@@ -4322,7 +4352,7 @@ func (o *baseObject) httpResponse(ctx context.Context, url, method string, optio
 		delete(req.Header, "Range")
 	}
 	o.addResourceKey(req.Header)
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err = o.fs.readTimingCall("media-headers", func() (bool, error) {
 		res, err = o.fs.client.Do(req)
 		if err == nil {
 			err = googleapi.CheckResponse(res)
@@ -4776,3 +4806,134 @@ var (
 	_ fs.SetMetadataer   = (*Directory)(nil)
 	_ fs.ParentIDer      = (*Directory)(nil)
 )
+
+var driveReadTimingSequence atomic.Uint64
+
+type driveReadTimer struct {
+	id        uint64
+	operation string
+	started   time.Time
+	report    func(string, ...any)
+}
+
+func newDriveReadTimer(operation string, report func(string, ...any)) *driveReadTimer {
+	if report == nil {
+		report = func(format string, args ...any) { fs.Logf(nil, format, args...) }
+	}
+	return &driveReadTimer{id: driveReadTimingSequence.Add(1), operation: operation, started: time.Now(), report: report}
+}
+
+func (t *driveReadTimer) event(event, fields string) {
+	t.report("DRIVE READ TIMING id=%d operation=%s event=%s elapsed_ms=%.3f %s", t.id, t.operation, event, float64(time.Since(t.started))/float64(time.Millisecond), fields)
+}
+
+// readTimingCall separates time waiting for pacing from time spent in API attempts.
+func (f *Fs) readTimingCall(operation string, call func() (bool, error)) error {
+	if !f.opt.ReadTiming {
+		return f.pacer.Call(call)
+	}
+	timer := newDriveReadTimer(operation, nil)
+	timer.event("phase-start", "")
+	attempt := 0
+	err := f.pacer.Call(func() (bool, error) {
+		attempt++
+		timer.event("attempt-start", fmt.Sprintf("attempt=%d", attempt))
+		retry, err := call()
+		timer.event("attempt-finished", fmt.Sprintf("attempt=%d retry=%t failed=%t", attempt, retry, err != nil))
+		return retry, err
+	})
+	timer.event("phase-finished", fmt.Sprintf("attempts=%d failed=%t", attempt, err != nil))
+	return err
+}
+
+type driveReadTimingTransport struct {
+	base   http.RoundTripper
+	report func(string, ...any)
+}
+
+func (t *driveReadTimingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	operation := "other"
+	switch {
+	case strings.HasSuffix(req.URL.Path, "/token"):
+		operation = "oauth"
+	case req.URL.Query().Get("alt") == "media":
+		operation = "media"
+	case strings.HasSuffix(req.URL.Path, "/files"):
+		operation = "list-directory"
+		if strings.Contains(req.URL.Query().Get("q"), "name=") {
+			operation = "list-filtered"
+		}
+	case strings.HasSuffix(req.URL.Path, "/about"):
+		operation = "about"
+	case strings.HasSuffix(req.URL.Path, "/files/root"):
+		operation = "root-metadata"
+	case strings.Contains(req.URL.Path, "/files/"):
+		operation = "metadata"
+	}
+	timer := newDriveReadTimer(operation, t.report)
+	timer.event("http-start", "")
+	trace := &httptrace.ClientTrace{
+		GetConn: func(string) { timer.event("connection-start", "") },
+		GotConn: func(info httptrace.GotConnInfo) {
+			timer.event("connection-ready", fmt.Sprintf("reused=%t", info.Reused))
+		},
+		DNSStart: func(httptrace.DNSStartInfo) { timer.event("dns-start", "") },
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			timer.event("dns-finished", fmt.Sprintf("failed=%t", info.Err != nil))
+		},
+		ConnectStart:      func(string, string) { timer.event("tcp-start", "") },
+		ConnectDone:       func(_, _ string, err error) { timer.event("tcp-finished", fmt.Sprintf("failed=%t", err != nil)) },
+		TLSHandshakeStart: func() { timer.event("tls-start", "") },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			timer.event("tls-finished", fmt.Sprintf("failed=%t", err != nil))
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			timer.event("request-written", fmt.Sprintf("failed=%t", info.Err != nil))
+		},
+		GotFirstResponseByte: func() { timer.event("first-response-byte", "") },
+	}
+	response, err := t.base.RoundTrip(req.Clone(httptrace.WithClientTrace(req.Context(), trace)))
+	status := 0
+	if response != nil {
+		status = response.StatusCode
+	}
+	timer.event("http-headers", fmt.Sprintf("status=%d failed=%t", status, err != nil))
+	if err == nil && response != nil && response.Body != nil {
+		response.Body = &driveReadTimingBody{ReadCloser: response.Body, timer: timer}
+	}
+	return response, err
+}
+
+func (t *driveReadTimingTransport) CloseIdleConnections() {
+	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+type driveReadTimingBody struct {
+	io.ReadCloser
+	timer *driveReadTimer
+	bytes atomic.Int64
+	ended sync.Once
+	first sync.Once
+}
+
+func (b *driveReadTimingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.bytes.Add(int64(n))
+	if n > 0 {
+		b.first.Do(func() { b.timer.event("body-first-read", fmt.Sprintf("bytes=%d", n)) })
+	}
+	if err != nil {
+		b.ended.Do(func() {
+			b.timer.event("body-read-finished", fmt.Sprintf("bytes=%d eof=%t failed=%t", b.bytes.Load(), err == io.EOF, err != io.EOF))
+		})
+	}
+	return n, err
+}
+
+func (b *driveReadTimingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.timer.event("body-closed", fmt.Sprintf("bytes=%d failed=%t", b.bytes.Load(), err != nil))
+	return err
+}
