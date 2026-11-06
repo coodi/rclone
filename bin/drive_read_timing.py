@@ -11,7 +11,7 @@ OPERATIONS = {
     "media", "media-headers", "oauth", "other", "formats", "about",
 }
 EVENTS = {
-    "phase-start", "attempt-start", "attempt-finished", "phase-finished",
+    "listing-start", "listing-finished", "phase-start", "attempt-start", "attempt-finished", "phase-finished",
     "http-start", "connection-start", "connection-ready", "dns-start",
     "dns-finished", "tcp-start", "tcp-finished", "tls-start", "tls-finished",
     "request-written", "first-response-byte", "http-headers",
@@ -20,7 +20,7 @@ EVENTS = {
 PREFIX = re.compile(
     r"DRIVE READ TIMING id=(\d+) operation=([a-z-]+) event=([a-z-]+) elapsed_ms=(\d+(?:\.\d+)?)"
 )
-FIELDS = re.compile(r"\b(status|failed|reused|bytes|attempts|retry)=(\d+|true|false)\b")
+FIELDS = re.compile(r"\b(status|failed|reused|bytes|attempts|retry|pages|parents)=(\d+|true|false)\b")
 
 
 def summarize(lines):
@@ -34,12 +34,12 @@ def summarize(lines):
             continue
         identifier = int(identifier)
         row = records.setdefault(identifier, {"id": identifier, "operation": operation, "events": []})
-        if event in {"http-start", "phase-start", "backend-created"} and any(item[0] == event for item in row["events"]):
+        if event in {"http-start", "phase-start", "backend-created", "listing-start"} and any(item[0] == event for item in row["events"]):
             raise ValueError("Repeated event ID: supply logs from one process only")
         if row["operation"] != operation:
             raise ValueError("Mixed process logs: an event ID has conflicting operations")
         row["events"].append((event, float(elapsed), dict(FIELDS.findall(line[match.end():]))))
-    totals = defaultdict(lambda: {"http_requests": 0, "headers_ms": 0.0, "pacer_wait_ms": 0.0, "api_attempts": 0})
+    totals = defaultdict(lambda: {"http_requests": 0, "headers_ms": 0.0, "pacer_wait_ms": 0.0, "api_attempts": 0, "list_groups": 0, "list_pages": 0})
     rows = []
     for row in sorted(records.values(), key=lambda item: item["id"]):
         output = {"id": row["id"], "operation": row["operation"]}
@@ -47,7 +47,13 @@ def summarize(lines):
         wait = 0.0
         attempts = 0
         for event, elapsed, fields in row["events"]:
-            if event == "phase-start":
+            if event == "listing-finished":
+                output["list_elapsed_ms"] = elapsed
+                output["list_pages"] = int(fields.get("pages", "0"))
+                output["parents"] = int(fields.get("parents", "0"))
+                totals[row["operation"]]["list_groups"] += 1
+                totals[row["operation"]]["list_pages"] += output["list_pages"]
+            elif event == "phase-start":
                 previous_end = elapsed
             elif event == "attempt-start":
                 wait += max(0.0, elapsed - previous_end)
