@@ -29,6 +29,9 @@ import (
 
 // latencyFixture exercises the real Drive lookup and Open paths without credentials.
 type latencyFixture struct {
+	shortcuts                         int
+	oauthDelay, listDelay, mediaDelay time.Duration
+	timing                            bool
 	oauth                             bool
 	tokens                            atomic.Int64
 	tokenNanos, listNanos, mediaNanos atomic.Int64
@@ -56,10 +59,19 @@ func newLatencyFixture(tb testing.TB, delay time.Duration) *latencyFixture {
 				x.listNanos.Add(elapsed)
 			}
 		}()
+		delay := x.delay
+		switch {
+		case r.URL.Path == "/token" && x.oauthDelay > 0:
+			delay = x.oauthDelay
+		case r.URL.Query().Get("alt") == "media" && x.mediaDelay > 0:
+			delay = x.mediaDelay
+		case strings.HasSuffix(r.URL.Path, "/files") && x.listDelay > 0:
+			delay = x.listDelay
+		}
 		select {
 		case <-r.Context().Done():
 			return
-		case <-time.After(x.delay):
+		case <-time.After(delay):
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/token" {
@@ -93,6 +105,11 @@ func newLatencyFixture(tb testing.TB, delay time.Duration) *latencyFixture {
 					if i != x.directorySize-1 {
 						item.Id = fmt.Sprintf("synthetic-%d", i)
 						item.Name = fmt.Sprintf("other-%d.bin", i)
+					}
+					if i < x.shortcuts {
+						item.Md5Checksum = ""
+						item.MimeType = shortcutMimeType
+						item.ShortcutDetails = &drive.FileShortcutDetails{TargetId: "synthetic-file", TargetMimeType: "application/octet-stream"}
 					}
 					files = append(files, &item)
 				}
@@ -129,6 +146,9 @@ func (x *latencyFixture) newFs(tb testing.TB) *Fs {
 	tb.Helper()
 	ctx := context.Background()
 	client := x.server.Client()
+	if x.timing {
+		client = &http.Client{Transport: &driveReadTimingTransport{base: client.Transport}}
+	}
 	if x.oauth {
 		config := &oauth2.Config{ClientID: "synthetic-client", ClientSecret: "synthetic-secret", Endpoint: oauth2.Endpoint{TokenURL: x.server.URL + "/token"}}
 		oauthContext := context.WithValue(ctx, oauth2.HTTPClient, client)
@@ -137,6 +157,7 @@ func (x *latencyFixture) newFs(tb testing.TB) *Fs {
 	service, err := drive.NewService(ctx, option.WithHTTPClient(client), option.WithEndpoint(x.server.URL+"/"))
 	require.NoError(tb, err)
 	f := &Fs{svc: service, client: client, rootFolderID: "synthetic-root", pacer: fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(0), pacer.Burst(1000000)))}
+	f.opt.ReadTiming = x.timing
 	f.features = &fs.Features{}
 	f.ci = fs.GetConfig(ctx)
 	f.dirResourceKeys = new(sync.Map)
@@ -339,4 +360,84 @@ func TestDriveRootIDBaseline(t *testing.T) {
 	require.Equal(t, int64(1), x.gets.Load())
 	require.Equal(t, int64(0), x.lists.Load())
 	t.Logf("root lookup including synthetic OAuth refresh: %s; token handler: %s", time.Since(started), time.Duration(x.tokenNanos.Load()))
+}
+
+func TestDriveColdReadAttribution(t *testing.T) {
+	for _, phase := range []string{"oauth", "listing", "media"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, ci := fs.AddConfig(context.Background())
+			ci.BufferSize = 0
+			x := newLatencyFixture(t, 0)
+			x.oauth = true
+			x.timing = true
+			x.directorySize = 1001
+			switch phase {
+			case "oauth":
+				x.oauthDelay = 120 * time.Millisecond
+			case "listing":
+				x.listDelay = 60 * time.Millisecond
+			case "media":
+				x.mediaDelay = 120 * time.Millisecond
+			}
+			f := x.newFs(t)
+			opt := vfscommon.Opt
+			opt.ReadOnly = true
+			opt.CacheMode = vfscommon.CacheModeOff
+			opt.PollInterval = 0
+			opt.DirCacheTime = fs.Duration(5 * time.Minute)
+			opt.ChunkSize = 8192
+			opt.ChunkSizeLimit = 8192
+			filesystem := vfs.New(ctx, f, &opt)
+			defer filesystem.Shutdown()
+			for i := 0; i < 2; i++ {
+				start := time.Now()
+				node, err := filesystem.Stat("media.bin")
+				require.NoError(t, err)
+				stat := time.Since(start)
+				in, err := node.(*vfs.File).Open(os.O_RDONLY)
+				require.NoError(t, err)
+				_, err = in.Seek(int64(i*8192), io.SeekStart)
+				require.NoError(t, err)
+				var first [1]byte
+				_, err = io.ReadFull(in, first[:])
+				require.NoError(t, err)
+				firstByte := time.Since(start)
+				_, err = io.CopyN(io.Discard, in, 8191)
+				require.NoError(t, err)
+				require.NoError(t, in.Close())
+				require.Equal(t, int64(1), x.tokens.Load())
+				require.Equal(t, int64(2), x.unfiltered.Load())
+				t.Logf("injected=%s read=%d stat=%s first-byte=%s total=%s", phase, i, stat, firstByte, time.Since(start))
+			}
+		})
+	}
+}
+
+func TestDriveColdShortcutAmplification(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.BufferSize = 0
+	x := newLatencyFixture(t, 5*time.Millisecond)
+	x.directorySize = 13
+	x.shortcuts = 12
+	f := x.newFs(t)
+	opt := vfscommon.Opt
+	opt.ReadOnly = true
+	opt.CacheMode = vfscommon.CacheModeOff
+	opt.PollInterval = 0
+	opt.DirCacheTime = fs.Duration(5 * time.Minute)
+	filesystem := vfs.New(ctx, f, &opt)
+	defer filesystem.Shutdown()
+	for i := 0; i < 2; i++ {
+		start := time.Now()
+		node, err := filesystem.Stat("media.bin")
+		require.NoError(t, err)
+		require.True(t, node.IsFile())
+		require.Equal(t, int64(1), x.lists.Load())
+		require.Equal(t, int64(12), x.gets.Load())
+		t.Logf("read=%d stat=%s list=%d shortcut-metadata=%d media=%d", i, time.Since(start), x.lists.Load(), x.gets.Load(), x.media.Load())
+	}
+	before := x.gets.Load()
+	_, err := f.NewObject(ctx, "media.bin")
+	require.NoError(t, err)
+	require.Equal(t, before, x.gets.Load(), "a direct regular-file lookup does not resolve unrelated shortcuts")
 }

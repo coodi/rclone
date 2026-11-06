@@ -33,3 +33,7 @@ The first synthetic investigation is documented in [docs/drive-read-baseline.md]
 ## VFS and 1.75.2 follow-up
 
 [docs/drive-vfs-read-investigation.md](docs/drive-vfs-read-investigation.md) records the full-listing path used by `serve http`, 8 MiB synthetic HTTP ranges on official 1.75.2, and a generic VFS patch removing an unnecessary zero-offset media open before an initial nonzero read. This seek patch does not change directory listing or explain the reported cold first-byte delay.
+
+## Cold-read attribution
+
+[docs/drive-cold-read-diagnostics.md](docs/drive-cold-read-diagnostics.md) records additional pre-media work (including sequential resolution of unrelated shortcuts), synthetic phase attribution, and opt-in `--drive-read-timing` instrumentation. The next discriminating authorized experiment is a cold HEAD followed by GET, with anonymous phase timing records. A real cold-delay cause is not claimed from aggregate timings alone.
