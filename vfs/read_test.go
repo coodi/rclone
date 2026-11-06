@@ -2,10 +2,13 @@ package vfs
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"sync"
 	"testing"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -229,4 +232,53 @@ func TestReadFileHandleRelease(t *testing.T) {
 	err = fh.Release()
 	assert.NoError(t, err)
 	assert.True(t, fh.closed)
+}
+
+type initialOffsetObject struct {
+	fs.Object
+	mu      sync.Mutex
+	offsets []int64
+}
+
+func (o *initialOffsetObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	var offset int64
+	for _, option := range options {
+		if r, ok := option.(*fs.RangeOption); ok {
+			offset, _ = r.Decode(o.Size())
+		}
+	}
+	o.mu.Lock()
+	o.offsets = append(o.offsets, offset)
+	o.mu.Unlock()
+	return o.Object.Open(ctx, options...)
+}
+
+func TestReadFileHandleInitialOffset(t *testing.T) {
+	for _, streams := range []int{0, 2} {
+		for _, useReadAt := range []bool{false, true} {
+			t.Run(fmt.Sprintf("streams=%d/readAt=%v", streams, useReadAt), func(t *testing.T) {
+				_, _, fh := readHandleCreate(t)
+				fh.file.VFS().Opt.ChunkStreams = streams
+				tracked := &initialOffsetObject{Object: fh.file.getObject()}
+				fh.file.setObjectNoUpdate(tracked)
+				var b [1]byte
+				var n int
+				var err error
+				if useReadAt {
+					n, err = fh.ReadAt(b[:], 5)
+				} else {
+					_, err = fh.Seek(5, io.SeekStart)
+					require.NoError(t, err)
+					n, err = fh.Read(b[:])
+				}
+				require.NoError(t, err)
+				require.Equal(t, 1, n)
+				require.Equal(t, byte('5'), b[0])
+				require.NoError(t, fh.Close())
+				tracked.mu.Lock()
+				defer tracked.mu.Unlock()
+				require.Equal(t, []int64{5}, tracked.offsets, "the first backend open must start at the requested offset")
+			})
+		}
+	}
 }

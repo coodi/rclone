@@ -70,15 +70,27 @@ func newReadFileHandle(f *File) (*ReadFileHandle, error) {
 
 // openPending opens the file if there is a pending open
 // call with the lock held
-func (fh *ReadFileHandle) openPending() (err error) {
+func (fh *ReadFileHandle) openPending(offset int64) (err error) {
 	if fh.opened {
 		return nil
 	}
 	o := fh.file.getObject()
 	opt := &fh.file.VFS().Opt
-	r, err := chunkedreader.New(fh.file.ctx, o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams).Open()
+	r := chunkedreader.New(fh.file.ctx, o, int64(opt.ChunkSize), int64(opt.ChunkSizeLimit), opt.ChunkStreams)
+	// Avoid opening an unused range at zero before the first positioned read.
+	initialSeek := offset > 0 && offset < fh.size && !fh.noSeek
+	if initialSeek {
+		if _, err = r.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+	}
+	r, err = r.Open()
 	if err != nil {
 		return err
+	}
+	if initialSeek {
+		fh.offset = offset
+		fh.hash = nil
 	}
 	tr := accounting.GlobalStats().NewTransfer(o, nil)
 	fh.done = tr.Done
@@ -256,7 +268,7 @@ func waitSequential(what string, remote string, cond *sync.Cond, maxWait time.Du
 // Implementation of ReadAt - call with lock held
 func (fh *ReadFileHandle) readAt(p []byte, off int64) (n int, err error) {
 	// defer log.Trace(fh.remote, "p[%d], off=%d", len(p), off)("n=%d, err=%v", &n, &err)
-	err = fh.openPending() // FIXME pending open could be more efficient in the presence of seek (and retries)
+	err = fh.openPending(off)
 	if err != nil {
 		return 0, err
 	}
